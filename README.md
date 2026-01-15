@@ -29,8 +29,9 @@ transformers:
   - type: "domain_transformer:DomainTransformer"
     config:
       csv_file: "domain_mapping.csv"
-      datahub_url: "http://localhost:8080"
-      datahub_token: "your_token"  # Optional
+      # datahub_url and datahub_token are optional - auto-detected from sink config
+      # datahub_url: "http://localhost:8080"  # Optional: only needed if different from sink
+      # datahub_token: "your_token"  # Optional: only needed if different from sink
       mapping:
         database: "DatabaseName"
         schema: null
@@ -55,8 +56,9 @@ transformers:
       table_name: "domain_mapping_table"
       database: "your_database"  # Optional
       schema: null  # Optional
-      datahub_url: "http://localhost:8080"
-      datahub_token: "your_token"  # Optional
+      # datahub_url and datahub_token are optional - auto-detected from sink config
+      # datahub_url: "http://localhost:8080"  # Optional: only needed if different from sink
+      # datahub_token: "your_token"  # Optional: only needed if different from sink
       mapping:
         database: "DatabaseName"
         schema: null
@@ -116,10 +118,19 @@ Then your table should have columns named `DatabaseName`, `TableName`, and `Doma
 
 - **database**: Database name for table-based lookups (uses source default if not provided)
 - **schema**: Schema name for table-based lookups (optional)
-- **datahub_url**: DataHub GMS URL for domain creation
-- **datahub_token**: DataHub authentication token
+- **datahub_url**: DataHub GMS URL for domain creation (auto-detected from sink config if not provided)
+- **datahub_token**: DataHub authentication token (auto-detected from sink config if not provided)
 - **static.domain_parent**: Default parent domain for all domains
 - **semantics**: "PATCH" (add to existing) or "REPLACE" (replace all)
+
+### DataHub Connection Auto-Detection
+
+The transformer automatically detects the DataHub URL and token from:
+1. **Sink Configuration**: Reads from the `datahub-rest` sink configuration in your ingestion recipe
+2. **Environment Variables**: Falls back to `DATAHUB_GMS_URL`/`DATAHUB_SERVER` and `DATAHUB_TOKEN` environment variables
+3. **Explicit Config**: Uses `datahub_url` and `datahub_token` from transformer config if provided
+
+You typically don't need to specify `datahub_url` and `datahub_token` in the transformer config unless you want to use different credentials than the sink.
 
 ## How It Works
 
@@ -160,7 +171,7 @@ transformers:
   - type: "domain_transformer:DomainTransformer"
     config:
       csv_file: "domain_mapping.csv"
-      datahub_url: "http://localhost:8080"
+      # datahub_url and datahub_token auto-detected from sink config
       mapping:
         database: "DatabaseName"
         table: "TableName"
@@ -187,7 +198,7 @@ transformers:
       table_name: "domain_mapping"
       database: "analytics_db"
       schema: "metadata"
-      datahub_url: "http://localhost:8080"
+      # datahub_url and datahub_token auto-detected from sink config
       mapping:
         database: "DatabaseName"
         schema: "SchemaName"

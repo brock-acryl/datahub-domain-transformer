@@ -47,8 +47,8 @@ class DomainTransformerConfig(ConfigModel):
     table_name: Optional[str] = None  # Database table name for lookup
     database: Optional[str] = None  # Database name (optional, uses source default if not provided)
     schema: Optional[str] = None  # Schema name (optional)
-    datahub_url: Optional[str] = None
-    datahub_token: Optional[str] = None
+    datahub_url: Optional[str] = None  # Optional: DataHub GMS URL (auto-detected from sink config if not provided)
+    datahub_token: Optional[str] = None  # Optional: DataHub auth token (auto-detected from sink config if not provided)
     mapping: Dict[str, Optional[str]] = {}
     static: Dict[str, Optional[str]] = {}
     semantics: str = "PATCH"  # PATCH = add to existing, REPLACE = replace existing
@@ -69,16 +69,24 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         self.domain_mapping = {}
         self.domain_info_map = {}
         
-        # Initialize emitter for domain creation if connection info provided
+        # Initialize emitter for domain creation
+        # Try to get DataHub URL and token from pipeline context (sink config) if not provided
+        datahub_url = config.datahub_url
+        datahub_token = config.datahub_token
+        
+        if not datahub_url:
+            # Try to get from pipeline context (sink configuration)
+            datahub_url, datahub_token = self._get_datahub_connection_from_context()
+        
         self.emitter = None
-        if config.datahub_url:
+        if datahub_url:
             self.emitter = DatahubRestEmitter(
-                gms_server=config.datahub_url,
-                token=config.datahub_token
+                gms_server=datahub_url,
+                token=datahub_token
             )
-            logger.info(f"Initialized emitter for domain creation: {config.datahub_url}")
+            logger.info(f"Initialized emitter for domain creation: {datahub_url}")
         else:
-            logger.warning("No datahub_url provided - domain creation will be limited to graph client")
+            logger.warning("No datahub_url provided and could not retrieve from pipeline context - domain creation will be limited to graph client")
         
         # Load CSV immediately if provided (doesn't need source connection)
         if config.csv_file:
@@ -211,6 +219,53 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         logger.info(f"Loaded {len(mapping)} domain mappings from CSV file: {csv_file}")
         logger.info(f"Found {len(domain_info_map)} unique domains")
         return mapping, domain_info_map
+
+    def _get_datahub_connection_from_context(self) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Get DataHub URL and token from pipeline context (sink configuration)
+        
+        Returns:
+            Tuple of (datahub_url, datahub_token) or (None, None) if not found
+        """
+        # Try to get from sink configuration
+        if hasattr(self.ctx, 'pipeline_config'):
+            pipeline_config = self.ctx.pipeline_config
+            if hasattr(pipeline_config, 'sink'):
+                sink = pipeline_config.sink
+                # Check if it's a datahub-rest sink
+                if hasattr(sink, 'config'):
+                    sink_config = sink.config
+                    # Try to get GMS server URL
+                    gms_server = None
+                    token = None
+                    
+                    if hasattr(sink_config, 'server'):
+                        gms_server = sink_config.server
+                    elif hasattr(sink_config, 'gms_server'):
+                        gms_server = sink_config.gms_server
+                    elif hasattr(sink_config, 'datahub_server'):
+                        gms_server = sink_config.datahub_server
+                    
+                    # Try to get token
+                    if hasattr(sink_config, 'token'):
+                        token = sink_config.token
+                    elif hasattr(sink_config, 'datahub_token'):
+                        token = sink_config.datahub_token
+                    
+                    if gms_server:
+                        logger.info(f"Retrieved DataHub URL from sink config: {gms_server}")
+                        return (gms_server, token)
+        
+        # Try to get from environment variables (common DataHub pattern)
+        import os
+        gms_server = os.getenv('DATAHUB_GMS_URL') or os.getenv('DATAHUB_SERVER')
+        token = os.getenv('DATAHUB_TOKEN')
+        
+        if gms_server:
+            logger.info(f"Retrieved DataHub URL from environment: {gms_server}")
+            return (gms_server, token)
+        
+        return (None, None)
 
     def _get_source_connection(self):
         """

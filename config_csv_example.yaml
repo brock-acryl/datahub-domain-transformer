@@ -19,8 +19,9 @@ transformers:
   - type: "domain_transformer:DomainTransformer"
     config:
       csv_file: "domain_mapping.csv"  # Path to CSV mapping file
-      datahub_url: "http://localhost:8080"  # DataHub GMS URL
-      datahub_token: "your_datahub_token_here"  # Optional: DataHub auth token
+      # datahub_url and datahub_token are optional - will be auto-detected from sink config
+      # datahub_url: "http://localhost:8080"  # Optional: DataHub GMS URL (auto-detected if not provided)
+      # datahub_token: "your_datahub_token_here"  # Optional: DataHub auth token (auto-detected if not provided)
       mapping:
         database: "DatabaseName"  # CSV column name for database
         schema: null  # CSV column name for schema (null if not used)

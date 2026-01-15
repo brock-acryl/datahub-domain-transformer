@@ -710,7 +710,11 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         if domain_info.parent_domain:
             parent_domain_urn = make_domain_urn(domain_info.parent_domain)
             # Recursively ensure parent domain exists
+            logger.debug(f"Ensuring parent domain exists: {domain_info.parent_domain}")
             self._create_domain_if_missing(domain_info.parent_domain)
+            # Verify parent domain was created/exists
+            if not self._domain_exists(parent_domain_urn):
+                logger.warning(f"Parent domain {domain_info.parent_domain} may not exist. Child domain creation may fail.")
             parent_domain_urn = make_domain_urn(domain_info.parent_domain)
 
         logger.info(f"Creating domain: {domain_id} ({domain_info.domain_name})")
@@ -732,9 +736,13 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         if self.emitter:
             try:
                 self.emitter.emit(domain_properties_mcp)
+                # Flush to ensure the emit is actually sent
+                if hasattr(self.emitter, 'flush'):
+                    self.emitter.flush()
                 logger.info(f"Successfully created domain: {domain_urn}")
             except Exception as e:
                 logger.error(f"Failed to emit domain creation MCP: {e}")
+                raise
         else:
             # Try to use graph client's emitter if available
             try:

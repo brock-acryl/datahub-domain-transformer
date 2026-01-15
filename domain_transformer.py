@@ -27,7 +27,6 @@ from datahub.ingestion.transformer.base_transformer import (
 from datahub.metadata.schema_classes import DomainsClass, DomainPropertiesClass
 from datahub.emitter.mce_builder import make_domain_urn
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
-from datahub.emitter.rest_emitter import DatahubRestEmitter
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +46,10 @@ class DomainTransformerConfig(ConfigModel):
     table_name: Optional[str] = None  # Database table name for lookup
     database: Optional[str] = None  # Database name (optional, uses source default if not provided)
     schema: Optional[str] = None  # Schema name (optional)
-    datahub_url: Optional[str] = None  # Optional: DataHub GMS URL (auto-detected from sink config if not provided)
-    datahub_token: Optional[str] = None  # Optional: DataHub auth token (auto-detected from sink config if not provided)
+    # Note: datahub_url and datahub_token are deprecated - use self.ctx.graph instead
+    # Kept for backward compatibility but not used
+    datahub_url: Optional[str] = None
+    datahub_token: Optional[str] = None
     mapping: Dict[str, Optional[str]] = {}
     static: Dict[str, Optional[str]] = {}
     semantics: str = "PATCH"  # PATCH = add to existing, REPLACE = replace existing
@@ -69,24 +70,12 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         self.domain_mapping = {}
         self.domain_info_map = {}
         
-        # Initialize emitter for domain creation
-        # Try to get DataHub URL and token from pipeline context (sink config) if not provided
-        datahub_url = config.datahub_url
-        datahub_token = config.datahub_token
-        
-        if not datahub_url:
-            # Try to get from pipeline context (sink configuration)
-            datahub_url, datahub_token = self._get_datahub_connection_from_context()
-        
-        self.emitter = None
-        if datahub_url:
-            self.emitter = DatahubRestEmitter(
-                gms_server=datahub_url,
-                token=datahub_token
-            )
-            logger.info(f"Initialized emitter for domain creation: {datahub_url}")
+        # Use the graph client from PipelineContext - it's already configured with
+        # the sink's server URL and authentication token, so no need to configure separately
+        if not self.ctx.graph:
+            logger.warning("PipelineContext.graph is not available - domain creation will not work")
         else:
-            logger.warning("No datahub_url provided and could not retrieve from pipeline context - domain creation will be limited to graph client")
+            logger.info("Using PipelineContext.graph for domain creation (already configured with sink connection)")
         
         # Load CSV immediately if provided (doesn't need source connection)
         if config.csv_file:
@@ -219,53 +208,6 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         logger.info(f"Loaded {len(mapping)} domain mappings from CSV file: {csv_file}")
         logger.info(f"Found {len(domain_info_map)} unique domains")
         return mapping, domain_info_map
-
-    def _get_datahub_connection_from_context(self) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Get DataHub URL and token from pipeline context (sink configuration)
-        
-        Returns:
-            Tuple of (datahub_url, datahub_token) or (None, None) if not found
-        """
-        # Try to get from sink configuration
-        if hasattr(self.ctx, 'pipeline_config'):
-            pipeline_config = self.ctx.pipeline_config
-            if hasattr(pipeline_config, 'sink'):
-                sink = pipeline_config.sink
-                # Check if it's a datahub-rest sink
-                if hasattr(sink, 'config'):
-                    sink_config = sink.config
-                    # Try to get GMS server URL
-                    gms_server = None
-                    token = None
-                    
-                    if hasattr(sink_config, 'server'):
-                        gms_server = sink_config.server
-                    elif hasattr(sink_config, 'gms_server'):
-                        gms_server = sink_config.gms_server
-                    elif hasattr(sink_config, 'datahub_server'):
-                        gms_server = sink_config.datahub_server
-                    
-                    # Try to get token
-                    if hasattr(sink_config, 'token'):
-                        token = sink_config.token
-                    elif hasattr(sink_config, 'datahub_token'):
-                        token = sink_config.datahub_token
-                    
-                    if gms_server:
-                        logger.info(f"Retrieved DataHub URL from sink config: {gms_server}")
-                        return (gms_server, token)
-        
-        # Try to get from environment variables (common DataHub pattern)
-        import os
-        gms_server = os.getenv('DATAHUB_GMS_URL') or os.getenv('DATAHUB_SERVER')
-        token = os.getenv('DATAHUB_TOKEN')
-        
-        if gms_server:
-            logger.info(f"Retrieved DataHub URL from environment: {gms_server}")
-            return (gms_server, token)
-        
-        return (None, None)
 
     def _get_source_connection(self):
         """
@@ -732,29 +674,34 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
             aspect=domain_properties
         )
 
-        # Emit using emitter if available
-        if self.emitter:
+        # Emit using graph client from PipelineContext (already configured with sink connection)
+        if not self.ctx.graph:
+            logger.error(f"Cannot create domain {domain_urn} - PipelineContext.graph is not available")
+            raise RuntimeError("PipelineContext.graph is not available - cannot create domains")
+        
+        try:
+            # DataHubGraph has an emit_mcp method for emitting MetadataChangeProposalWrapper
+            # This uses the connection already configured from the sink
+            self.ctx.graph.emit_mcp(domain_properties_mcp)
+            logger.info(f"Successfully created domain: {domain_urn}")
+        except AttributeError:
+            # Fallback: try alternative method names if emit_mcp doesn't exist
             try:
-                self.emitter.emit(domain_properties_mcp)
-                # Flush to ensure the emit is actually sent
-                if hasattr(self.emitter, 'flush'):
-                    self.emitter.flush()
-                logger.info(f"Successfully created domain: {domain_urn}")
+                # Some versions might use emit or ingest_mcp
+                if hasattr(self.ctx.graph, 'emit'):
+                    self.ctx.graph.emit(domain_properties_mcp)
+                    logger.info(f"Successfully created domain via emit: {domain_urn}")
+                elif hasattr(self.ctx.graph, 'ingest_mcp'):
+                    self.ctx.graph.ingest_mcp(domain_properties_mcp)
+                    logger.info(f"Successfully created domain via ingest_mcp: {domain_urn}")
+                else:
+                    raise AttributeError("DataHubGraph does not have emit_mcp, emit, or ingest_mcp methods")
             except Exception as e:
-                logger.error(f"Failed to emit domain creation MCP: {e}")
+                logger.error(f"Failed to create domain {domain_urn}: {e}")
                 raise
-        else:
-            # Try to use graph client's emitter if available
-            try:
-                if hasattr(self.ctx, 'graph') and self.ctx.graph:
-                    # Graph client might have an emitter
-                    if hasattr(self.ctx.graph, 'emit'):
-                        self.ctx.graph.emit(domain_properties_mcp)
-                        logger.info(f"Created domain via graph client: {domain_urn}")
-                    else:
-                        logger.warning(f"Cannot create domain {domain_urn} - no emitter available")
-            except Exception as e:
-                logger.error(f"Failed to create domain via graph client: {e}")
+        except Exception as e:
+            logger.error(f"Failed to create domain {domain_urn}: {e}")
+            raise
 
         self.created_domains.add(domain_urn)
         return domain_urn

@@ -118,19 +118,16 @@ Then your table should have columns named `DatabaseName`, `TableName`, and `Doma
 
 - **database**: Database name for table-based lookups (uses source default if not provided)
 - **schema**: Schema name for table-based lookups (optional)
-- **datahub_url**: DataHub GMS URL for domain creation (auto-detected from sink config if not provided)
-- **datahub_token**: DataHub authentication token (auto-detected from sink config if not provided)
+- **datahub_url**: (Deprecated) No longer needed - uses PipelineContext.graph instead
+- **datahub_token**: (Deprecated) No longer needed - uses PipelineContext.graph instead
 - **static.domain_parent**: Default parent domain for all domains
 - **semantics**: "PATCH" (add to existing) or "REPLACE" (replace all)
 
-### DataHub Connection Auto-Detection
+### DataHub Connection
 
-The transformer automatically detects the DataHub URL and token from:
-1. **Sink Configuration**: Reads from the `datahub-rest` sink configuration in your ingestion recipe
-2. **Environment Variables**: Falls back to `DATAHUB_GMS_URL`/`DATAHUB_SERVER` and `DATAHUB_TOKEN` environment variables
-3. **Explicit Config**: Uses `datahub_url` and `datahub_token` from transformer config if provided
+The transformer uses `PipelineContext.graph` which is automatically configured with your sink's server URL and authentication token. **No need to configure `datahub_url` or `datahub_token` separately!** 
 
-You typically don't need to specify `datahub_url` and `datahub_token` in the transformer config unless you want to use different credentials than the sink.
+The `PipelineContext.graph` object is already set up with the connection information from your sink configuration, so domain creation will automatically use the same authentication as the rest of your ingestion pipeline.
 
 ## How It Works
 

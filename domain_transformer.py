@@ -320,7 +320,7 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         else:
             # Try to access as attributes
             config_dict = {}
-            for attr in ['host_port', 'host', 'port', 'username', 'password', 'database', 'schema']:
+            for attr in ['host_port', 'host', 'port', 'username', 'password', 'database', 'schema', 'options']:
                 if hasattr(source_config, attr):
                     config_dict[attr] = getattr(source_config, attr)
         
@@ -329,6 +329,10 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
             source_type = config_dict.get('type') or config_dict.get('_type') or 'teradata'
         
         logger.info(f"Creating connection from source config (type: {source_type})")
+        
+        # Extract options/connect_args if present
+        options = config_dict.get('options', {})
+        connect_args = options.get('connect_args', {}) if isinstance(options, dict) else {}
         
         # Build connection string based on source type
         if source_type.lower() == 'teradata':
@@ -350,6 +354,10 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
             
             connection_url = f"teradatasql://{username_encoded}:{password_encoded}@{host_port}/"
             logger.debug(f"Created Teradata connection URL: teradatasql://{username_encoded}:***@{host_port}/")
+            
+            # Create engine with connect_args if provided
+            if connect_args:
+                return create_engine(connection_url, connect_args=connect_args)
             
         elif source_type.lower() in ['snowflake', 'snowflake_legacy']:
             # Snowflake connection
@@ -396,10 +404,14 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
             if 'sql_alchemy_url' in config_dict or hasattr(source_config, 'sql_alchemy_url'):
                 connection_url = config_dict.get('sql_alchemy_url') or getattr(source_config, 'sql_alchemy_url', None)
                 if connection_url:
+                    if connect_args:
+                        return create_engine(connection_url, connect_args=connect_args)
                     return create_engine(connection_url)
             raise ValueError(f"Unsupported source type: {source_type}. Supported types: teradata, snowflake, postgresql")
         
-        # Create and return engine
+        # Create and return engine with connect_args if provided
+        if connect_args:
+            return create_engine(connection_url, connect_args=connect_args)
         return create_engine(connection_url)
 
     def _load_mapping_from_table(

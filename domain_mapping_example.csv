@@ -1,0 +1,9 @@
+DatabaseName,TableName,DomainID
+analytics_db,customer_dimension,analytics_001
+analytics_db,sales_fact,analytics_001
+marketing_db,campaign_data,marketing_001
+marketing_db,lead_data,marketing_001
+finance_db,revenue_table,finance_001
+finance_db,expense_table,finance_001
+operations_db,order_table,operations_001
+operations_db,inventory_table,operations_001

@@ -1,0 +1,2 @@
+datahub>=0.8.0
+sqlalchemy>=1.4.0

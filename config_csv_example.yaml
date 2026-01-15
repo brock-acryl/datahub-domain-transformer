@@ -1,0 +1,34 @@
+# Example DataHub Ingestion configuration using CSV Domain Transformer
+source:
+  type: "teradata"  # or "snowflake", "postgresql", etc.
+  config:
+    include_table_lineage: false
+    password: "your_password_here"
+    include_usage_statistics: false
+    host_port: "your-host.example.com:1025"
+    include_queries: false
+    stateful_ingestion:
+      enabled: false
+    database_pattern:
+      allow:
+        - "your_database"
+      ignoreCase: true
+    username: "your_username"
+
+transformers:
+  - type: "domain_transformer:DomainTransformer"
+    config:
+      csv_file: "domain_mapping.csv"  # Path to CSV mapping file
+      datahub_url: "http://localhost:8080"  # DataHub GMS URL
+      datahub_token: "your_datahub_token_here"  # Optional: DataHub auth token
+      mapping:
+        database: "DatabaseName"  # CSV column name for database
+        schema: null  # CSV column name for schema (null if not used)
+        table: "TableName"  # CSV column name for table
+        domain: "DomainID"  # CSV column name for domain ID
+        parent_domain: null  # CSV column name for parent domain (optional)
+        domain_description: null  # CSV column name for domain description (optional)
+      static:
+        platform: "teradata"  # Platform name (must match source type)
+        domain_parent: "parent_domain_id"  # Optional: default parent domain for all domains
+      semantics: "PATCH"  # PATCH = add to existing domains, REPLACE = replace all domains

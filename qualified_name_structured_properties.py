@@ -3,6 +3,10 @@ Universal transformer that adds structured properties to entities based on quali
 
 Extracts components from entity URNs (database, table, column, etc.) and adds them as
 structured properties. Only adds properties that are explicitly configured.
+
+This transformer processes entities and adds structured properties based on qualified name parsing.
+For columns (schemaFields), it processes the schemaMetadata aspect and creates separate MCPs
+for each column's structured properties.
 """
 
 from typing import List, Optional, Dict, Any, Iterable
@@ -11,8 +15,11 @@ from datahub.ingestion.api.common import PipelineContext, RecordEnvelope
 from datahub.configuration.common import ConfigModel
 from datahub.metadata.schema_classes import (
     StructuredPropertiesClass,
-    StructuredPropertyValueAssignmentClass
+    StructuredPropertyValueAssignmentClass,
+    ContainerPropertiesClass,
+    SchemaMetadataClass
 )
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
 
 
 class QualifiedNameStructuredPropertiesConfig(ConfigModel):
@@ -49,6 +56,67 @@ class QualifiedNameStructuredProperties(BaseTransformer):
     def _parse_qualified_name(self, entity_urn: str) -> Optional[Dict[str, Any]]:
         """Parse entity URN to extract qualified name components."""
         try:
+            # Handle column URNs: urn:li:schemaField:(urn:li:dataset:(...),column_name)
+            if 'schemafield' in entity_urn.lower():
+                # Extract column name from outer parentheses (last component before closing paren)
+                last_comma_idx = entity_urn.rfind(',')
+                last_paren_idx = entity_urn.rfind(')')
+                if last_comma_idx > 0 and last_paren_idx > last_comma_idx:
+                    column_name = entity_urn[last_comma_idx + 1:last_paren_idx].strip()
+                    
+                    # Extract dataset URN from nested structure
+                    dataset_start = entity_urn.find('urn:li:dataset:')
+                    if dataset_start >= 0:
+                        # Find the matching closing paren for the dataset URN
+                        dataset_part = entity_urn[dataset_start:]
+                        paren_count = 0
+                        dataset_end = -1
+                        for i, char in enumerate(dataset_part):
+                            if char == '(':
+                                paren_count += 1
+                            elif char == ')':
+                                paren_count -= 1
+                                if paren_count == 0:
+                                    dataset_end = i + 1
+                                    break
+                        
+                        if dataset_end > 0:
+                            dataset_urn = dataset_part[:dataset_end]
+                            # Parse dataset URN directly (don't recurse to avoid issues)
+                            if '(' in dataset_urn and ')' in dataset_urn:
+                                parts = dataset_urn.split('(')[1].split(')')[0]
+                                components = [p.strip() for p in parts.split(',')]
+                                
+                                if len(components) >= 2:
+                                    qualified_name = components[1]
+                                    env = components[2] if len(components) > 2 else self.config.environment
+                                    
+                                    # Check if qualified name has @ symbol
+                                    if '@' in qualified_name:
+                                        name_part, platform_part = qualified_name.rsplit('@', 1)
+                                    else:
+                                        name_part = qualified_name
+                                        platform_part = self.config.platform_prefix
+                                    
+                                    # Parse name part to get database and table
+                                    if '.' in name_part:
+                                        name_parts = name_part.split('.')
+                                        if len(name_parts) >= 2:
+                                            database = name_parts[0]
+                                            table = name_parts[1]
+                                            qualified_name_full = f"{database}.{table}.{column_name}@{platform_part}"
+                                            
+                                            return {
+                                                'type': 'column',
+                                                'database': database,
+                                                'table': table,
+                                                'column': column_name,
+                                                'platform': platform_part,
+                                                'environment': env,
+                                                'qualified_name': qualified_name_full
+                                            }
+            
+            # Handle standard URNs with parentheses: urn:li:entity:(platform,qualified_name,env)
             if '(' in entity_urn and ')' in entity_urn:
                 parts = entity_urn.split('(')[1].split(')')[0]
                 components = [p.strip() for p in parts.split(',')]
@@ -69,27 +137,28 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                                 'qualified_name': qualified_name
                             }
                         else:
-                            parts = name_part.split('.')
-                            if len(parts) == 2:
+                            name_parts = name_part.split('.')
+                            if len(name_parts) == 2:
                                 return {
                                     'type': 'table',
-                                    'database': parts[0],
-                                    'table': parts[1],
+                                    'database': name_parts[0],
+                                    'table': name_parts[1],
                                     'platform': platform_part,
                                     'environment': env,
                                     'qualified_name': qualified_name
                                 }
-                            elif len(parts) == 3:
+                            elif len(name_parts) == 3:
                                 return {
                                     'type': 'column',
-                                    'database': parts[0],
-                                    'table': parts[1],
-                                    'column': parts[2],
+                                    'database': name_parts[0],
+                                    'table': name_parts[1],
+                                    'column': name_parts[2],
                                     'platform': platform_part,
                                     'environment': env,
                                     'qualified_name': qualified_name
                                 }
             
+            # Fallback for dataset URNs without @ in qualified name
             if 'dataset' in entity_urn.lower():
                 if ',' in entity_urn:
                     parts = entity_urn.split(',')
@@ -174,6 +243,65 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                 entity_urn = None
                 snapshot = None
                 
+                # Handle MCPs (MetadataChangeProposalWrapper) - containers often come as MCPs
+                if isinstance(record, MetadataChangeProposalWrapper):
+                    # MCPs can have entityUrn and aspect directly, or in a proposal attribute
+                    entity_urn = None
+                    aspect = None
+                    aspect_name = None
+                    
+                    # Check direct attributes first
+                    if hasattr(record, 'entityUrn'):
+                        entity_urn = record.entityUrn
+                    if hasattr(record, 'aspect'):
+                        aspect = record.aspect
+                    if hasattr(record, 'aspectName'):
+                        aspect_name = record.aspectName
+                    
+                    # Check proposal attribute
+                    if not entity_urn and hasattr(record, 'proposal') and record.proposal:
+                        entity_urn = record.proposal.entityUrn if hasattr(record.proposal, 'entityUrn') else None
+                        aspect = record.proposal.aspect if hasattr(record.proposal, 'aspect') else None
+                        aspect_name = record.proposal.aspectName if hasattr(record.proposal, 'aspectName') else None
+                    
+                    # For MCPs, the aspect is in proposal.aspect
+                    if 'container' in (entity_urn or '').lower():
+                        if aspect and isinstance(aspect, ContainerPropertiesClass):
+                            database_name = aspect.name
+                            if database_name:
+                                env = aspect.env if aspect.env else self.config.environment
+                                qualified_name = f"{database_name}@{self.config.platform_prefix}"
+                                parsed_info = {
+                                    'type': 'database',
+                                    'name': database_name,
+                                    'platform': self.config.platform_prefix,
+                                    'environment': env,
+                                    'qualified_name': qualified_name
+                                }
+                                # For MCPs, we need to add structuredProperties as a new MCP
+                                new_props = self._create_structured_properties(parsed_info)
+                                if new_props.properties:
+                                    # Create a new MCP for structuredProperties
+                                    structured_props_mcp = MetadataChangeProposalWrapper(
+                                        entityUrn=entity_urn,
+                                        aspect=new_props
+                                    )
+                                    # Yield both the original MCP and the new structuredProperties MCP
+                                    yield record_envelope
+                                    yield RecordEnvelope(record=structured_props_mcp, metadata=record_envelope.metadata)
+                                    continue
+                                else:
+                                    yield record_envelope
+                                    continue
+                
+                # Quick check: try to get entity_urn early for debugging
+                if hasattr(record, 'urn') and getattr(record, 'urn', None) is not None:
+                    entity_urn = record.urn
+                elif hasattr(record, 'proposedSnapshot') and record.proposedSnapshot and hasattr(record.proposedSnapshot, 'urn'):
+                    entity_urn = record.proposedSnapshot.urn
+                elif hasattr(record, 'entityUrn'):
+                    entity_urn = record.entityUrn
+                
                 if hasattr(record, 'urn') and getattr(record, 'urn', None) is not None:
                     snapshot = record
                     entity_urn = record.urn
@@ -194,7 +322,62 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                     yield record_envelope
                     continue
                 
+                # Process schemaMetadata to add structured properties to columns
+                schema_metadata = None
+                if hasattr(record, 'proposedSnapshot') and record.proposedSnapshot and hasattr(record.proposedSnapshot, 'aspects'):
+                    for aspect in record.proposedSnapshot.aspects:
+                        if isinstance(aspect, SchemaMetadataClass):
+                            schema_metadata = aspect
+                            break
+                elif hasattr(snapshot, 'aspects'):
+                    for aspect in snapshot.aspects:
+                        if isinstance(aspect, SchemaMetadataClass):
+                            schema_metadata = aspect
+                            break
+                
+                # If we have schemaMetadata, process columns
+                if schema_metadata and schema_metadata.fields:
+                    # Parse dataset URN to get database and table info
+                    dataset_parsed = self._parse_qualified_name(entity_urn)
+                    if dataset_parsed and dataset_parsed.get('type') == 'table':
+                        database = dataset_parsed.get('database')
+                        table = dataset_parsed.get('table')
+                        platform = dataset_parsed.get('platform', self.config.platform_prefix)
+                        env = dataset_parsed.get('environment', self.config.environment)
+                        
+                        # Process each field/column
+                        for field in schema_metadata.fields:
+                            if field.fieldPath:
+                                column_name = field.fieldPath
+                                # Build qualified name for column
+                                qualified_name = f"{database}.{table}.{column_name}@{platform}"
+                                column_parsed_info = {
+                                    'type': 'column',
+                                    'database': database,
+                                    'table': table,
+                                    'column': column_name,
+                                    'platform': platform,
+                                    'environment': env,
+                                    'qualified_name': qualified_name
+                                }
+                                
+                                # Create structured properties for this column
+                                column_props = self._create_structured_properties(column_parsed_info)
+                                if column_props.properties:
+                                    # Create schemaField URN: urn:li:schemaField:(dataset_urn,fieldPath)
+                                    from datahub.emitter.mce_builder import make_schema_field_urn
+                                    schema_field_urn = make_schema_field_urn(entity_urn, field.fieldPath)
+                                    
+                                    # Create MCP for column structured properties
+                                    column_mcp = MetadataChangeProposalWrapper(
+                                        entityUrn=schema_field_urn,
+                                        aspect=column_props
+                                    )
+                                    yield RecordEnvelope(record=column_mcp, metadata=record_envelope.metadata)
+                
+                # Parse URN for entity-level structured properties
                 parsed_info = self._parse_qualified_name(entity_urn)
+                
                 if not parsed_info:
                     yield record_envelope
                     continue

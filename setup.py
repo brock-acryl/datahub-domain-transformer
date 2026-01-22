@@ -10,7 +10,7 @@ setup(
     description="DataHub ingestion transformer for automatic domain mapping",
     author="Your Name",
     author_email="your.email@example.com",
-    py_modules=["domain_transformer"],
+    py_modules=["domain_transformer", "qualified_name_structured_properties"],
     install_requires=[
         "datahub>=0.8.0",
         "sqlalchemy>=1.4.0",

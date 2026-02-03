@@ -15,16 +15,18 @@ import csv
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Tuple
 from dataclasses import dataclass
 
 from datahub.configuration.common import ConfigModel
-from datahub.ingestion.api.common import PipelineContext
-from datahub.ingestion.transformer.base_transformer import (
-    BaseTransformer,
-    SingleAspectTransformer,
+from datahub.ingestion.api.common import PipelineContext, RecordEnvelope
+from datahub.ingestion.transformer.base_transformer import BaseTransformer
+from datahub.metadata.schema_classes import (
+    DomainsClass,
+    DomainPropertiesClass,
+    StructuredPropertiesClass,
+    StructuredPropertyValueAssignmentClass,
 )
-from datahub.metadata.schema_classes import DomainsClass, DomainPropertiesClass
 from datahub.emitter.mce_builder import make_domain_urn
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
 
@@ -53,9 +55,12 @@ class DomainTransformerConfig(ConfigModel):
     mapping: Dict[str, Optional[str]] = {}
     static: Dict[str, Optional[str]] = {}
     semantics: str = "PATCH"  # PATCH = add to existing, REPLACE = replace existing
+    write_to_domain: bool = True
+    structured_property_urn: Optional[str] = None
+    structured_property_value: Literal["id", "urn"] = "id"
 
 
-class DomainTransformer(BaseTransformer, SingleAspectTransformer):
+class DomainTransformer(BaseTransformer):
     """Lookup domains from a CSV file or database table and create missing domains"""
 
     ctx: PipelineContext
@@ -108,9 +113,21 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
         """Return entity types this transformer processes"""
         return ["dataset"]
 
-    def aspect_name(self) -> str:
-        """Return the aspect name this transformer modifies"""
-        return "domains"
+    def _get_entity_urn_from_record(self, record: object) -> Optional[str]:
+        """Extract entity URN from an MCE or MCP record."""
+        if hasattr(record, "entityUrn") and getattr(record, "entityUrn", None):
+            return record.entityUrn
+        if hasattr(record, "proposal") and getattr(record, "proposal", None):
+            p = record.proposal
+            if hasattr(p, "entityUrn") and getattr(p, "entityUrn", None):
+                return p.entityUrn
+        if hasattr(record, "urn") and getattr(record, "urn", None):
+            return record.urn
+        if hasattr(record, "proposedSnapshot") and getattr(record, "proposedSnapshot", None):
+            snap = record.proposedSnapshot
+            if hasattr(snap, "urn") and getattr(snap, "urn", None):
+                return snap.urn
+        return None
 
     def _load_mapping_from_csv(
         self,
@@ -727,63 +744,100 @@ class DomainTransformer(BaseTransformer, SingleAspectTransformer):
                 logger.error(f"Failed to load mapping from table: {e}")
                 raise
 
-    def transform_aspect(
-        self, entity_urn: str, aspect_name: str, aspect: Optional[DomainsClass]
-    ) -> Optional[DomainsClass]:
-        """
-        Transform the domains aspect for a dataset
-        
-        Args:
-            entity_urn: Entity URN
-            aspect_name: Aspect name (should be "domains")
-            aspect: Existing domains aspect (may be None)
-            
-        Returns:
-            Transformed DomainsClass or None
-        """
-        # Ensure mapping is loaded (lazy load for table-based mapping)
-        self._ensure_mapping_loaded()
-        
-        # Only process dataset URNs
-        if not entity_urn.startswith('urn:li:dataset:'):
-            return aspect
+    def _get_existing_domains(self, entity_urn: str, record: object) -> Optional[DomainsClass]:
+        """Get existing domains aspect from graph or from record snapshot."""
+        if hasattr(record, "proposedSnapshot") and record.proposedSnapshot and hasattr(record.proposedSnapshot, "aspects"):
+            for asp in record.proposedSnapshot.aspects:
+                if isinstance(asp, DomainsClass):
+                    return asp
+        if hasattr(record, "snapshot") and record.snapshot and hasattr(record.snapshot, "aspects"):
+            for asp in record.snapshot.aspects:
+                if isinstance(asp, DomainsClass):
+                    return asp
+        if isinstance(record, MetadataChangeProposalWrapper) and hasattr(record, "aspect") and isinstance(record.aspect, DomainsClass):
+            return record.aspect
+        if self.ctx.graph:
+            try:
+                return self.ctx.graph.get_aspect(entity_urn=entity_urn, aspect_type=DomainsClass)
+            except Exception:
+                pass
+        return None
 
-        # Parse dataset URN
-        parsed = self._parse_dataset_urn(entity_urn)
-        if not parsed:
-            return aspect
+    def _get_existing_structured_properties(self, entity_urn: str, record: object) -> Optional[StructuredPropertiesClass]:
+        """Get existing structuredProperties aspect from graph or from record snapshot."""
+        if hasattr(record, "proposedSnapshot") and record.proposedSnapshot and hasattr(record.proposedSnapshot, "aspects"):
+            for asp in record.proposedSnapshot.aspects:
+                if isinstance(asp, StructuredPropertiesClass):
+                    return asp
+        if hasattr(record, "snapshot") and record.snapshot and hasattr(record.snapshot, "aspects"):
+            for asp in record.snapshot.aspects:
+                if isinstance(asp, StructuredPropertiesClass):
+                    return asp
+        if isinstance(record, MetadataChangeProposalWrapper) and hasattr(record, "aspect") and isinstance(record.aspect, StructuredPropertiesClass):
+            return record.aspect
+        if self.ctx.graph:
+            try:
+                return self.ctx.graph.get_aspect(entity_urn=entity_urn, aspect_type=StructuredPropertiesClass)
+            except Exception:
+                pass
+        return None
 
-        platform, database, schema, table = parsed
+    def transform(self, record_envelopes: Iterable[RecordEnvelope]) -> Iterable[RecordEnvelope]:
+        """Transform records: optionally add domain association and/or structured property from mapping."""
+        for record_envelope in record_envelopes:
+            record = record_envelope.record
+            entity_urn = self._get_entity_urn_from_record(record)
+            yield record_envelope
 
-        logger.debug(f"Parsed URN {entity_urn}: platform={platform}, database={database}, schema={schema}, table={table}")
+            if not entity_urn or not entity_urn.startswith("urn:li:dataset:"):
+                continue
 
-        # Find matching domain
-        domain_id = self._find_matching_domain(platform, database, schema, table)
+            self._ensure_mapping_loaded()
+            parsed = self._parse_dataset_urn(entity_urn)
+            if not parsed:
+                continue
 
-        if not domain_id:
-            logger.debug(f"No CSV match found for dataset {entity_urn} (platform={platform}, database={database}, schema={schema}, table={table})")
-            return aspect
+            platform, database, schema, table = parsed
+            logger.debug(f"Parsed URN {entity_urn}: platform={platform}, database={database}, schema={schema}, table={table}")
 
-        logger.info(f"Matched dataset {entity_urn} to domain {domain_id} (platform={platform}, database={database}, schema={schema}, table={table})")
-        
-        # Ensure domain exists (create if missing)
-        domain_urn = self._create_domain_if_missing(domain_id)
-        
-        # Get existing domains or create new
-        if aspect is None:
-            domains = DomainsClass(domains=[])
-        else:
-            domains = aspect
+            domain_id = self._find_matching_domain(platform, database, schema, table)
+            if not domain_id:
+                logger.debug(f"No match for dataset {entity_urn} (platform={platform}, database={database}, schema={schema}, table={table})")
+                continue
 
-        # Add domain if not already present
-        if domain_urn not in domains.domains:
-            if self.config.semantics == "PATCH":
-                # PATCH: Add to existing domains
-                domains.domains.append(domain_urn)
-                logger.info(f"Adding domain {domain_urn} to dataset {entity_urn}")
-            else:
-                # REPLACE: Replace all domains with this one
-                domains = DomainsClass(domains=[domain_urn])
-                logger.info(f"Replacing domains with {domain_urn} for dataset {entity_urn}")
+            logger.info(f"Matched dataset {entity_urn} to domain {domain_id} (platform={platform}, database={database}, schema={schema}, table={table})")
+            domain_urn = self._create_domain_if_missing(domain_id)
 
-        return domains
+            if self.config.write_to_domain:
+                existing = self._get_existing_domains(entity_urn, record)
+                if existing is None:
+                    domains_list: List[str] = []
+                else:
+                    domains_list = list(existing.domains) if existing.domains else []
+                if domain_urn not in domains_list:
+                    if self.config.semantics == "PATCH":
+                        domains_list = domains_list + [domain_urn]
+                        logger.info(f"Adding domain {domain_urn} to dataset {entity_urn}")
+                    else:
+                        domains_list = [domain_urn]
+                        logger.info(f"Replacing domains with {domain_urn} for dataset {entity_urn}")
+                domains_mcp = MetadataChangeProposalWrapper(
+                    entityUrn=entity_urn, aspect=DomainsClass(domains=domains_list)
+                )
+                yield RecordEnvelope(record=domains_mcp, metadata=record_envelope.metadata)
+
+            if self.config.structured_property_urn:
+                value = domain_id if self.config.structured_property_value == "id" else domain_urn
+                assignment = StructuredPropertyValueAssignmentClass(
+                    propertyUrn=self.config.structured_property_urn,
+                    values=[value],
+                )
+                existing = self._get_existing_structured_properties(entity_urn, record)
+                if self.config.semantics == "REPLACE" or existing is None or not existing.properties:
+                    structured_props = StructuredPropertiesClass(properties=[assignment])
+                else:
+                    existing_list = [p for p in existing.properties if p.propertyUrn != self.config.structured_property_urn]
+                    existing_list.append(assignment)
+                    structured_props = StructuredPropertiesClass(properties=existing_list)
+                sp_mcp = MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=structured_props)
+                yield RecordEnvelope(record=sp_mcp, metadata=record_envelope.metadata)

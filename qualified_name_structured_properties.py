@@ -9,6 +9,7 @@ For columns (schemaFields), it processes the schemaMetadata aspect and creates s
 for each column's structured properties.
 """
 
+import json
 from typing import List, Optional, Dict, Any, Iterable
 from datahub.ingestion.transformer.base_transformer import BaseTransformer
 from datahub.ingestion.api.common import PipelineContext, RecordEnvelope
@@ -266,33 +267,53 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                     
                     # For MCPs, the aspect is in proposal.aspect
                     if 'container' in (entity_urn or '').lower():
+                        database_name = None
+                        env = self.config.environment
                         if aspect and isinstance(aspect, ContainerPropertiesClass):
                             database_name = aspect.name
-                            if database_name:
-                                env = aspect.env if aspect.env else self.config.environment
-                                qualified_name = f"{database_name}@{self.config.platform_prefix}"
-                                parsed_info = {
-                                    'type': 'database',
-                                    'name': database_name,
-                                    'platform': self.config.platform_prefix,
-                                    'environment': env,
-                                    'qualified_name': qualified_name
-                                }
-                                # For MCPs, we need to add structuredProperties as a new MCP
-                                new_props = self._create_structured_properties(parsed_info)
-                                if new_props.properties:
-                                    # Create a new MCP for structuredProperties
-                                    structured_props_mcp = MetadataChangeProposalWrapper(
-                                        entityUrn=entity_urn,
-                                        aspect=new_props
-                                    )
-                                    # Yield both the original MCP and the new structuredProperties MCP
-                                    yield record_envelope
-                                    yield RecordEnvelope(record=structured_props_mcp, metadata=record_envelope.metadata)
-                                    continue
-                                else:
-                                    yield record_envelope
-                                    continue
+                            if aspect.env:
+                                env = aspect.env
+                        elif aspect and getattr(aspect, 'value', None):
+                            try:
+                                raw = getattr(aspect, 'value')
+                                data = json.loads(raw) if isinstance(raw, str) else raw
+                                database_name = data.get('name') if isinstance(data, dict) else None
+                                if isinstance(data, dict) and data.get('env'):
+                                    env = data['env']
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        if database_name:
+                            qualified_name = f"{database_name}@{self.config.platform_prefix}"
+                            parsed_info = {
+                                'type': 'database',
+                                'name': database_name,
+                                'platform': self.config.platform_prefix,
+                                'environment': env,
+                                'qualified_name': qualified_name
+                            }
+                            new_props = self._create_structured_properties(parsed_info)
+                            if new_props.properties:
+                                structured_props_mcp = MetadataChangeProposalWrapper(
+                                    entityUrn=entity_urn,
+                                    aspect=new_props
+                                )
+                                yield record_envelope
+                                yield RecordEnvelope(record=structured_props_mcp, metadata=record_envelope.metadata)
+                                continue
+                        yield record_envelope
+                        continue
+                    if 'dataset' in (entity_urn or '').lower():
+                        parsed_info = self._parse_qualified_name(entity_urn)
+                        if parsed_info and parsed_info.get('type') == 'table':
+                            new_props = self._create_structured_properties(parsed_info)
+                            if new_props.properties:
+                                structured_props_mcp = MetadataChangeProposalWrapper(
+                                    entityUrn=entity_urn,
+                                    aspect=new_props
+                                )
+                                yield record_envelope
+                                yield RecordEnvelope(record=structured_props_mcp, metadata=record_envelope.metadata)
+                                continue
                 
                 # Quick check: try to get entity_urn early for debugging
                 if hasattr(record, 'urn') and getattr(record, 'urn', None) is not None:

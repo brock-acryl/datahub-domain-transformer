@@ -26,6 +26,7 @@ class SimpleAddStructuredPropertiesConfig(ConfigModel):
     structured_properties_urns: Union[str, List[str]]
     value: str
     semantics: str = "PATCH"
+    entity_types: Optional[List[str]] = None  # default ["dataset"] to avoid writing to tags etc.
 
 
 class SimpleAddStructuredProperties(BaseTransformer, SingleAspectTransformer):
@@ -38,6 +39,7 @@ class SimpleAddStructuredProperties(BaseTransformer, SingleAspectTransformer):
         self.config = config
         urns = config.structured_properties_urns
         self._property_urns: List[str] = [urns] if isinstance(urns, str) else list(urns)
+        self._entity_types: List[str] = config.entity_types if config.entity_types is not None else ["dataset"]
 
     @classmethod
     def create(cls, config_dict: dict, ctx: PipelineContext) -> "SimpleAddStructuredProperties":
@@ -45,7 +47,7 @@ class SimpleAddStructuredProperties(BaseTransformer, SingleAspectTransformer):
         return cls(config, ctx)
 
     def entity_types(self) -> List[str]:
-        return ["*"]
+        return self._entity_types
 
     def aspect_name(self) -> str:
         return "structuredProperties"

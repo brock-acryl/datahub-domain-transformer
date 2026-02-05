@@ -782,19 +782,43 @@ class DomainTransformer(BaseTransformer):
                 pass
         return None
 
+    def _set_structured_properties_on_record(self, record: object, structured_props: StructuredPropertiesClass) -> bool:
+        """Merge structured_props into the record's snapshot so downstream transformers and sink see the full set."""
+        snapshot = None
+        if hasattr(record, "proposedSnapshot") and record.proposedSnapshot and hasattr(record.proposedSnapshot, "aspects"):
+            snapshot = record.proposedSnapshot
+        elif hasattr(record, "snapshot") and record.snapshot and hasattr(record.snapshot, "aspects"):
+            snapshot = record.snapshot
+        if not snapshot:
+            return False
+        existing_props = None
+        for asp in snapshot.aspects:
+            if isinstance(asp, StructuredPropertiesClass):
+                existing_props = asp
+                break
+        if existing_props:
+            existing_urns = {p.propertyUrn for p in existing_props.properties}
+            for p in structured_props.properties:
+                if p.propertyUrn not in existing_urns:
+                    existing_props.properties.append(p)
+        else:
+            snapshot.aspects.append(structured_props)
+        return True
+
     def transform(self, record_envelopes: Iterable[RecordEnvelope]) -> Iterable[RecordEnvelope]:
         """Transform records: optionally add domain association and/or structured property from mapping."""
         for record_envelope in record_envelopes:
             record = record_envelope.record
             entity_urn = self._get_entity_urn_from_record(record)
-            yield record_envelope
 
             if not entity_urn or not entity_urn.startswith("urn:li:dataset:"):
+                yield record_envelope
                 continue
 
             self._ensure_mapping_loaded()
             parsed = self._parse_dataset_urn(entity_urn)
             if not parsed:
+                yield record_envelope
                 continue
 
             platform, database, schema, table = parsed
@@ -803,6 +827,7 @@ class DomainTransformer(BaseTransformer):
             domain_id = self._find_matching_domain(platform, database, schema, table)
             if not domain_id:
                 logger.debug(f"No match for dataset {entity_urn} (platform={platform}, database={database}, schema={schema}, table={table})")
+                yield record_envelope
                 continue
 
             logger.info(f"Matched dataset {entity_urn} to domain {domain_id} (platform={platform}, database={database}, schema={schema}, table={table})")
@@ -839,5 +864,8 @@ class DomainTransformer(BaseTransformer):
                     existing_list = [p for p in existing.properties if p.propertyUrn != self.config.structured_property_urn]
                     existing_list.append(assignment)
                     structured_props = StructuredPropertiesClass(properties=existing_list)
+                self._set_structured_properties_on_record(record, structured_props)
                 sp_mcp = MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=structured_props)
                 yield RecordEnvelope(record=sp_mcp, metadata=record_envelope.metadata)
+
+            yield record_envelope

@@ -25,3 +25,4 @@ datahub_domain_transformer.egg-info/PKG-INFO
 datahub_domain_transformer.egg-info/requires.txt
 datahub_domain_transformer.egg-info/SOURCES.txt
 datahub_domain_transformer.egg-info/top_level.txt
+*.log

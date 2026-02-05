@@ -10,7 +10,7 @@ for each column's structured properties.
 """
 
 import json
-from typing import List, Optional, Dict, Any, Iterable
+from typing import List, Literal, Optional, Dict, Any, Iterable
 from datahub.ingestion.transformer.base_transformer import BaseTransformer
 from datahub.ingestion.api.common import PipelineContext, RecordEnvelope
 from datahub.configuration.common import ConfigModel
@@ -25,10 +25,11 @@ from datahub.emitter.mcp import MetadataChangeProposalWrapper
 
 class QualifiedNameStructuredPropertiesConfig(ConfigModel):
     """Configuration for QualifiedNameStructuredProperties transformer."""
-    
+
     environment: str = "prod"
     platform_prefix: str = "teradata.ndw.prod"
     structured_property_urns: Optional[Dict[str, str]] = None
+    semantics: Literal["PATCH", "REPLACE"] = "PATCH"
 
 
 class QualifiedNameStructuredProperties(BaseTransformer):
@@ -235,7 +236,34 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                 add_property_if_configured("column_name", parsed_info['column'])
         
         return StructuredPropertiesClass(properties=properties)
-    
+
+    def _get_existing_structured_properties(self, entity_urn: str, record: object) -> Optional[StructuredPropertiesClass]:
+        """Get existing structuredProperties from record (e.g. MCP aspect) or graph."""
+        if isinstance(record, MetadataChangeProposalWrapper) and hasattr(record, "aspect") and isinstance(record.aspect, StructuredPropertiesClass):
+            return record.aspect
+        if hasattr(record, "proposal") and record.proposal and hasattr(record.proposal, "aspect") and isinstance(record.proposal.aspect, StructuredPropertiesClass):
+            return record.proposal.aspect
+        if self.graph:
+            try:
+                return self.graph.get_aspect(entity_urn=entity_urn, aspect_type=StructuredPropertiesClass)
+            except Exception:
+                pass
+        return None
+
+    def _merge_structured_props(self, new_props: StructuredPropertiesClass, existing: Optional[StructuredPropertiesClass]) -> StructuredPropertiesClass:
+        """Merge new_props into existing when semantics is PATCH; otherwise return new_props."""
+        if self.config.semantics != "PATCH" or not existing or not existing.properties:
+            return new_props
+        merged = list(existing.properties)
+        existing_urns = {p.propertyUrn for p in merged}
+        for p in new_props.properties:
+            if p.propertyUrn in existing_urns:
+                merged = [p if x.propertyUrn == p.propertyUrn else x for x in merged]
+            else:
+                merged.append(p)
+                existing_urns.add(p.propertyUrn)
+        return StructuredPropertiesClass(properties=merged)
+
     def transform(self, record_envelopes: Iterable[RecordEnvelope]) -> Iterable[RecordEnvelope]:
         """Transform records by adding structured properties based on qualified name parsing."""
         for record_envelope in record_envelopes:
@@ -293,9 +321,11 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                             }
                             new_props = self._create_structured_properties(parsed_info)
                             if new_props.properties:
+                                existing = self._get_existing_structured_properties(entity_urn, record)
+                                aspect_to_send = self._merge_structured_props(new_props, existing)
                                 structured_props_mcp = MetadataChangeProposalWrapper(
                                     entityUrn=entity_urn,
-                                    aspect=new_props
+                                    aspect=aspect_to_send
                                 )
                                 yield record_envelope
                                 yield RecordEnvelope(record=structured_props_mcp, metadata=record_envelope.metadata)
@@ -307,9 +337,11 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                         if parsed_info and parsed_info.get('type') == 'table':
                             new_props = self._create_structured_properties(parsed_info)
                             if new_props.properties:
+                                existing = self._get_existing_structured_properties(entity_urn, record)
+                                aspect_to_send = self._merge_structured_props(new_props, existing)
                                 structured_props_mcp = MetadataChangeProposalWrapper(
                                     entityUrn=entity_urn,
-                                    aspect=new_props
+                                    aspect=aspect_to_send
                                 )
                                 yield record_envelope
                                 yield RecordEnvelope(record=structured_props_mcp, metadata=record_envelope.metadata)

@@ -10,6 +10,7 @@ for each column's structured properties.
 """
 
 import json
+import logging
 from typing import List, Literal, Optional, Dict, Any, Iterable
 from datahub.ingestion.transformer.base_transformer import BaseTransformer
 from datahub.ingestion.api.common import PipelineContext, RecordEnvelope
@@ -21,6 +22,8 @@ from datahub.metadata.schema_classes import (
     SchemaMetadataClass
 )
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
+
+logger = logging.getLogger(__name__)
 
 
 class QualifiedNameStructuredPropertiesConfig(ConfigModel):
@@ -46,6 +49,8 @@ class QualifiedNameStructuredProperties(BaseTransformer):
         self.config = config
         self.ctx = ctx
         self.graph = ctx.graph if hasattr(ctx, 'graph') else None
+        self._exists_cache: Dict[str, bool] = {}
+        self._structured_props_cache: Dict[str, Optional[StructuredPropertiesClass]] = {}
     
     @classmethod
     def create(cls, config_dict: dict, ctx: PipelineContext) -> "QualifiedNameStructuredProperties":
@@ -189,7 +194,24 @@ class QualifiedNameStructuredProperties(BaseTransformer):
         if self.config.structured_property_urns and property_name in self.config.structured_property_urns:
             return self.config.structured_property_urns[property_name]
         return f"urn:li:structuredProperty:{property_name}"
-    
+
+    def _structured_property_definition_exists(self, property_urn: str) -> bool:
+        """Return True if the structured property definition exists in DataHub (or we cannot check). Cached per run."""
+        if not property_urn or not property_urn.startswith("urn:li:structuredProperty:"):
+            return True
+        if property_urn in self._exists_cache:
+            return self._exists_cache[property_urn]
+        out = True
+        if self.graph:
+            try:
+                exists = getattr(self.graph, "exists", None)
+                if callable(exists):
+                    out = exists(property_urn)
+            except Exception:
+                pass
+        self._exists_cache[property_urn] = out
+        return out
+
     def _create_structured_properties(self, parsed_info: Dict[str, Any]) -> StructuredPropertiesClass:
         """Create structured properties from parsed info. Only adds configured properties."""
         properties = []
@@ -198,13 +220,17 @@ class QualifiedNameStructuredProperties(BaseTransformer):
             return StructuredPropertiesClass(properties=[])
         
         def add_property_if_configured(property_name: str, value: Any):
-            if property_name in self.config.structured_property_urns:
-                properties.append(
-                    StructuredPropertyValueAssignmentClass(
-                        propertyUrn=self._get_property_urn(property_name),
-                        values=[value] if not isinstance(value, list) else value
-                    )
+            if property_name not in self.config.structured_property_urns:
+                return
+            urn = self._get_property_urn(property_name)
+            if not self._structured_property_definition_exists(urn):
+                return
+            properties.append(
+                StructuredPropertyValueAssignmentClass(
+                    propertyUrn=urn,
+                    values=[value] if not isinstance(value, list) else value
                 )
+            )
         
         if 'qualified_name' in parsed_info:
             add_property_if_configured("qualified_name", parsed_info['qualified_name'])
@@ -238,23 +264,39 @@ class QualifiedNameStructuredProperties(BaseTransformer):
         return StructuredPropertiesClass(properties=properties)
 
     def _get_existing_structured_properties(self, entity_urn: str, record: object) -> Optional[StructuredPropertiesClass]:
-        """Get existing structuredProperties from record (e.g. MCP aspect) or graph."""
+        """Get existing structuredProperties from record (e.g. MCP aspect) or graph. Graph result cached per run."""
         if isinstance(record, MetadataChangeProposalWrapper) and hasattr(record, "aspect") and isinstance(record.aspect, StructuredPropertiesClass):
+            if record.aspect.properties:
+                logger.debug("QualifiedNameStructuredProperties: existing from mcp for %s: %s", entity_urn, [p.propertyUrn for p in record.aspect.properties])
             return record.aspect
         if hasattr(record, "proposal") and record.proposal and hasattr(record.proposal, "aspect") and isinstance(record.proposal.aspect, StructuredPropertiesClass):
             return record.proposal.aspect
+        if entity_urn in self._structured_props_cache:
+            return self._structured_props_cache[entity_urn]
+        asp = None
         if self.graph:
             try:
-                return self.graph.get_aspect(entity_urn=entity_urn, aspect_type=StructuredPropertiesClass)
+                asp = self.graph.get_aspect(entity_urn=entity_urn, aspect_type=StructuredPropertiesClass)
+                if asp is not None and asp.properties:
+                    logger.debug(
+                        "QualifiedNameStructuredProperties: existing from graph for %s: %s",
+                        entity_urn,
+                        [p.propertyUrn for p in asp.properties],
+                    )
             except Exception:
                 pass
-        return None
+        self._structured_props_cache[entity_urn] = asp
+        return asp
 
     def _merge_structured_props(self, new_props: StructuredPropertiesClass, existing: Optional[StructuredPropertiesClass]) -> StructuredPropertiesClass:
         """Merge new_props into existing when semantics is PATCH; otherwise return new_props."""
         if self.config.semantics != "PATCH" or not existing or not existing.properties:
             return new_props
-        merged = list(existing.properties)
+        existing_filtered = [
+            p for p in existing.properties
+            if self._structured_property_definition_exists(p.propertyUrn)
+        ]
+        merged = list(existing_filtered)
         existing_urns = {p.propertyUrn for p in merged}
         for p in new_props.properties:
             if p.propertyUrn in existing_urns:
@@ -264,6 +306,33 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                 existing_urns.add(p.propertyUrn)
         return StructuredPropertiesClass(properties=merged)
 
+    def _log_incoming_structured_properties(self, record: object, entity_urn: Optional[str]) -> None:
+        """Log if the incoming record already has structured properties (from source or earlier in pipeline)."""
+        urns = None
+        source = None
+        if isinstance(record, MetadataChangeProposalWrapper) and hasattr(record, "aspect") and isinstance(record.aspect, StructuredPropertiesClass) and record.aspect.properties:
+            urns = [p.propertyUrn for p in record.aspect.properties]
+            source = "incoming_mcp"
+        elif hasattr(record, "proposedSnapshot") and record.proposedSnapshot and hasattr(record.proposedSnapshot, "aspects"):
+            for asp in record.proposedSnapshot.aspects:
+                if isinstance(asp, StructuredPropertiesClass) and asp.properties:
+                    urns = [p.propertyUrn for p in asp.properties]
+                    source = "incoming_proposedSnapshot"
+                    break
+        elif hasattr(record, "snapshot") and record.snapshot and hasattr(record.snapshot, "aspects"):
+            for asp in record.snapshot.aspects:
+                if isinstance(asp, StructuredPropertiesClass) and asp.properties:
+                    urns = [p.propertyUrn for p in asp.properties]
+                    source = "incoming_snapshot"
+                    break
+        if urns is not None and entity_urn and "dataset" in (entity_urn or "").lower():
+            logger.info(
+                "QualifiedNameStructuredProperties: record already has structured properties from %s for %s: %s",
+                source,
+                entity_urn,
+                urns,
+            )
+
     def transform(self, record_envelopes: Iterable[RecordEnvelope]) -> Iterable[RecordEnvelope]:
         """Transform records by adding structured properties based on qualified name parsing."""
         for record_envelope in record_envelopes:
@@ -271,7 +340,16 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                 record = record_envelope.record
                 entity_urn = None
                 snapshot = None
-                
+                if hasattr(record, "entityUrn"):
+                    entity_urn = record.entityUrn
+                elif hasattr(record, "proposal") and record.proposal and hasattr(record.proposal, "entityUrn"):
+                    entity_urn = record.proposal.entityUrn
+                elif hasattr(record, "urn"):
+                    entity_urn = record.urn
+                elif hasattr(record, "proposedSnapshot") and record.proposedSnapshot and hasattr(record.proposedSnapshot, "urn"):
+                    entity_urn = record.proposedSnapshot.urn
+                self._log_incoming_structured_properties(record, entity_urn)
+
                 # Handle MCPs (MetadataChangeProposalWrapper) - containers often come as MCPs
                 if isinstance(record, MetadataChangeProposalWrapper):
                     # MCPs can have entityUrn and aspect directly, or in a proposal attribute

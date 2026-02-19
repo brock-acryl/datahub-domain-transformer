@@ -74,6 +74,8 @@ class DomainTransformer(BaseTransformer):
         self._mapping_loaded = False
         self.domain_mapping = {}
         self.domain_info_map = {}
+        self._exists_cache: Dict[str, bool] = {}
+        self._structured_props_cache: Dict[str, Optional[StructuredPropertiesClass]] = {}
         
         # Use the graph client from PipelineContext - it's already configured with
         # the sink's server URL and authentication token, so no need to configure separately
@@ -768,19 +770,64 @@ class DomainTransformer(BaseTransformer):
         if hasattr(record, "proposedSnapshot") and record.proposedSnapshot and hasattr(record.proposedSnapshot, "aspects"):
             for asp in record.proposedSnapshot.aspects:
                 if isinstance(asp, StructuredPropertiesClass):
+                    if asp.properties:
+                        logger.debug(
+                            "Structured properties for %s from proposedSnapshot: %s",
+                            entity_urn,
+                            [p.propertyUrn for p in asp.properties],
+                        )
                     return asp
         if hasattr(record, "snapshot") and record.snapshot and hasattr(record.snapshot, "aspects"):
             for asp in record.snapshot.aspects:
                 if isinstance(asp, StructuredPropertiesClass):
+                    if asp.properties:
+                        logger.debug(
+                            "Structured properties for %s from snapshot: %s",
+                            entity_urn,
+                            [p.propertyUrn for p in asp.properties],
+                        )
                     return asp
         if isinstance(record, MetadataChangeProposalWrapper) and hasattr(record, "aspect") and isinstance(record.aspect, StructuredPropertiesClass):
+            if record.aspect.properties:
+                logger.debug(
+                    "Structured properties for %s from mcp: %s",
+                    entity_urn,
+                    [p.propertyUrn for p in record.aspect.properties],
+                )
             return record.aspect
+        if entity_urn in self._structured_props_cache:
+            return self._structured_props_cache[entity_urn]
+        asp = None
         if self.ctx.graph:
             try:
-                return self.ctx.graph.get_aspect(entity_urn=entity_urn, aspect_type=StructuredPropertiesClass)
+                asp = self.ctx.graph.get_aspect(entity_urn=entity_urn, aspect_type=StructuredPropertiesClass)
+                if asp is not None and asp.properties:
+                    logger.debug(
+                        "Structured properties for %s from graph: %s",
+                        entity_urn,
+                        [p.propertyUrn for p in asp.properties],
+                    )
             except Exception:
                 pass
-        return None
+        self._structured_props_cache[entity_urn] = asp
+        return asp
+
+    def _structured_property_definition_exists(self, property_urn: str) -> bool:
+        """Return True if the structured property definition exists in DataHub (or we cannot check). Cached per run."""
+        if not property_urn or not property_urn.startswith("urn:li:structuredProperty:"):
+            return True
+        if property_urn in self._exists_cache:
+            return self._exists_cache[property_urn]
+        out = True
+        if self.ctx.graph:
+            try:
+                exists = getattr(self.ctx.graph, "exists", None)
+                if callable(exists):
+                    out = exists(property_urn)
+            except Exception as e:
+                logger.debug("Could not check structured property definition %s: %s", property_urn, e)
+        self._exists_cache[property_urn] = out
+        return out
 
     def _set_structured_properties_on_record(self, record: object, structured_props: StructuredPropertiesClass) -> bool:
         """Merge structured_props into the record's snapshot so downstream transformers and sink see the full set."""
@@ -853,19 +900,37 @@ class DomainTransformer(BaseTransformer):
 
             if self.config.structured_property_urn:
                 value = domain_id if self.config.structured_property_value == "id" else domain_urn
-                assignment = StructuredPropertyValueAssignmentClass(
-                    propertyUrn=self.config.structured_property_urn,
-                    values=[value],
-                )
-                existing = self._get_existing_structured_properties(entity_urn, record)
-                if self.config.semantics == "REPLACE" or existing is None or not existing.properties:
-                    structured_props = StructuredPropertiesClass(properties=[assignment])
+                if not value or (isinstance(value, str) and not value.strip()):
+                    logger.warning(
+                        "Structured property value is empty for %s (domain_id=%s); skipping structured property write",
+                        entity_urn,
+                        domain_id,
+                    )
+                elif not self._structured_property_definition_exists(self.config.structured_property_urn):
+                    logger.warning(
+                        "Structured property definition does not exist for %s; skipping structured property write for %s",
+                        self.config.structured_property_urn,
+                        entity_urn,
+                    )
                 else:
-                    existing_list = [p for p in existing.properties if p.propertyUrn != self.config.structured_property_urn]
-                    existing_list.append(assignment)
-                    structured_props = StructuredPropertiesClass(properties=existing_list)
-                self._set_structured_properties_on_record(record, structured_props)
-                sp_mcp = MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=structured_props)
-                yield RecordEnvelope(record=sp_mcp, metadata=record_envelope.metadata)
+                    assignment = StructuredPropertyValueAssignmentClass(
+                        propertyUrn=self.config.structured_property_urn,
+                        values=[value],
+                    )
+                    existing = self._get_existing_structured_properties(entity_urn, record)
+                    if self.config.semantics == "REPLACE" or existing is None or not existing.properties:
+                        structured_props = StructuredPropertiesClass(properties=[assignment])
+                    else:
+                        existing_list = [
+                            p
+                            for p in existing.properties
+                            if p.propertyUrn != self.config.structured_property_urn
+                            and self._structured_property_definition_exists(p.propertyUrn)
+                        ]
+                        existing_list.append(assignment)
+                        structured_props = StructuredPropertiesClass(properties=existing_list)
+                    self._set_structured_properties_on_record(record, structured_props)
+                    sp_mcp = MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=structured_props)
+                    yield RecordEnvelope(record=sp_mcp, metadata=record_envelope.metadata)
 
             yield record_envelope

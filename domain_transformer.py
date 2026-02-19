@@ -32,6 +32,13 @@ from datahub.emitter.mcp import MetadataChangeProposalWrapper
 
 logger = logging.getLogger(__name__)
 
+try:
+    from datahub.specific.dataset import DatasetPatchBuilder
+    _PATCH_BUILDER_AVAILABLE = True
+except ImportError:
+    DatasetPatchBuilder = None
+    _PATCH_BUILDER_AVAILABLE = False
+
 
 @dataclass
 class DomainInfo:
@@ -881,16 +888,16 @@ class DomainTransformer(BaseTransformer):
             domain_urn = self._create_domain_if_missing(domain_id)
 
             if self.config.write_to_domain:
-                existing = self._get_existing_domains(entity_urn, record)
-                if existing is None:
-                    domains_list: List[str] = []
+                if self.config.semantics == "PATCH":
+                    domains_list: List[str] = [domain_urn]
+                    logger.info(f"PATCH: adding domain {domain_urn} to dataset {entity_urn} (no lookup)")
                 else:
-                    domains_list = list(existing.domains) if existing.domains else []
-                if domain_urn not in domains_list:
-                    if self.config.semantics == "PATCH":
-                        domains_list = domains_list + [domain_urn]
-                        logger.info(f"Adding domain {domain_urn} to dataset {entity_urn}")
+                    existing = self._get_existing_domains(entity_urn, record)
+                    if existing is None:
+                        domains_list = []
                     else:
+                        domains_list = list(existing.domains) if existing.domains else []
+                    if domain_urn not in domains_list:
                         domains_list = [domain_urn]
                         logger.info(f"Replacing domains with {domain_urn} for dataset {entity_urn}")
                 domains_mcp = MetadataChangeProposalWrapper(
@@ -906,31 +913,27 @@ class DomainTransformer(BaseTransformer):
                         entity_urn,
                         domain_id,
                     )
-                elif not self._structured_property_definition_exists(self.config.structured_property_urn):
-                    logger.warning(
-                        "Structured property definition does not exist for %s; skipping structured property write for %s",
-                        self.config.structured_property_urn,
-                        entity_urn,
-                    )
                 else:
-                    assignment = StructuredPropertyValueAssignmentClass(
-                        propertyUrn=self.config.structured_property_urn,
-                        values=[value],
-                    )
-                    existing = self._get_existing_structured_properties(entity_urn, record)
-                    if self.config.semantics == "REPLACE" or existing is None or not existing.properties:
-                        structured_props = StructuredPropertiesClass(properties=[assignment])
+                    if self.config.semantics == "PATCH" and _PATCH_BUILDER_AVAILABLE:
+                        patch_builder = DatasetPatchBuilder(entity_urn)
+                        patch_builder.add_structured_property(self.config.structured_property_urn, value)
+                        for patch_mcp in patch_builder.build():
+                            yield RecordEnvelope(record=patch_mcp, metadata=record_envelope.metadata)
                     else:
-                        existing_list = [
-                            p
-                            for p in existing.properties
-                            if p.propertyUrn != self.config.structured_property_urn
-                            and self._structured_property_definition_exists(p.propertyUrn)
-                        ]
-                        existing_list.append(assignment)
-                        structured_props = StructuredPropertiesClass(properties=existing_list)
-                    self._set_structured_properties_on_record(record, structured_props)
-                    sp_mcp = MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=structured_props)
-                    yield RecordEnvelope(record=sp_mcp, metadata=record_envelope.metadata)
+                        if not self._structured_property_definition_exists(self.config.structured_property_urn):
+                            logger.warning(
+                                "Structured property definition does not exist for %s; skipping for %s",
+                                self.config.structured_property_urn,
+                                entity_urn,
+                            )
+                        else:
+                            assignment = StructuredPropertyValueAssignmentClass(
+                                propertyUrn=self.config.structured_property_urn,
+                                values=[value],
+                            )
+                            structured_props = StructuredPropertiesClass(properties=[assignment])
+                            self._set_structured_properties_on_record(record, structured_props)
+                            sp_mcp = MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=structured_props)
+                            yield RecordEnvelope(record=sp_mcp, metadata=record_envelope.metadata)
 
             yield record_envelope

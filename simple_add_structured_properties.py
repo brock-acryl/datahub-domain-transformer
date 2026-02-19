@@ -6,7 +6,7 @@ or REPLACE (replace entire structured properties) semantics.
 """
 
 import logging
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from datahub.configuration.common import ConfigModel
 from datahub.ingestion.api.common import PipelineContext
@@ -40,6 +40,7 @@ class SimpleAddStructuredProperties(BaseTransformer, SingleAspectTransformer):
         urns = config.structured_properties_urns
         self._property_urns: List[str] = [urns] if isinstance(urns, str) else list(urns)
         self._entity_types: List[str] = config.entity_types if config.entity_types is not None else ["dataset"]
+        self._exists_cache: Dict[str, bool] = {}
 
     @classmethod
     def create(cls, config_dict: dict, ctx: PipelineContext) -> "SimpleAddStructuredProperties":
@@ -51,6 +52,23 @@ class SimpleAddStructuredProperties(BaseTransformer, SingleAspectTransformer):
 
     def aspect_name(self) -> str:
         return "structuredProperties"
+
+    def _structured_property_definition_exists(self, property_urn: str) -> bool:
+        """Return True if the structured property definition exists in DataHub (or we cannot check). Cached per run."""
+        if not property_urn or not property_urn.startswith("urn:li:structuredProperty:"):
+            return True
+        if property_urn in self._exists_cache:
+            return self._exists_cache[property_urn]
+        out = True
+        if self.ctx.graph:
+            try:
+                exists = getattr(self.ctx.graph, "exists", None)
+                if callable(exists):
+                    out = exists(property_urn)
+            except Exception:
+                pass
+        self._exists_cache[property_urn] = out
+        return out
 
     def transform_aspect(
         self, entity_urn: str, aspect_name: str, aspect: Optional[StructuredPropertiesClass]
@@ -64,7 +82,13 @@ class SimpleAddStructuredProperties(BaseTransformer, SingleAspectTransformer):
         ]
         if self.config.semantics == "REPLACE":
             return StructuredPropertiesClass(properties=assignments)
+        if self.config.semantics == "PATCH":
+            return StructuredPropertiesClass(properties=assignments)
         existing_list = list(aspect.properties) if aspect and aspect.properties else []
+        existing_list = [
+            p for p in existing_list
+            if self._structured_property_definition_exists(p.propertyUrn)
+        ]
         for a in assignments:
             existing_list = [p for p in existing_list if p.propertyUrn != a.propertyUrn]
             existing_list.append(a)

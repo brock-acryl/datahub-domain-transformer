@@ -25,6 +25,13 @@ from datahub.emitter.mcp import MetadataChangeProposalWrapper
 
 logger = logging.getLogger(__name__)
 
+try:
+    from datahub.specific.dataset import DatasetPatchBuilder
+    _DATASET_PATCH_AVAILABLE = True
+except ImportError:
+    DatasetPatchBuilder = None
+    _DATASET_PATCH_AVAILABLE = False
+
 
 class QualifiedNameStructuredPropertiesConfig(ConfigModel):
     """Configuration for QualifiedNameStructuredProperties transformer."""
@@ -288,6 +295,44 @@ class QualifiedNameStructuredProperties(BaseTransformer):
         self._structured_props_cache[entity_urn] = asp
         return asp
 
+    def _assignment_value(self, assignment: StructuredPropertyValueAssignmentClass) -> Any:
+        """Extract a single value for patch (string or number)."""
+        if not assignment.values:
+            return ""
+        v = assignment.values[0]
+        if isinstance(v, dict):
+            if "string" in v and v["string"] is not None:
+                return v["string"]
+            if "double" in v and v["double"] is not None:
+                return v["double"]
+        if hasattr(v, "string") and getattr(v, "string", None) is not None:
+            return v.string
+        if hasattr(v, "double") and getattr(v, "double", None) is not None:
+            return v.double
+        return str(v) if v else ""
+
+    def _emit_dataset_structured_props(self, entity_urn: str, new_props: StructuredPropertiesClass, record_envelope: RecordEnvelope):
+        """Emit structured properties for a dataset. When PATCH: use patch builder if available (no lookup), else emit only new_props. When not PATCH: lookup and merge."""
+        if self.config.semantics == "PATCH":
+            if _DATASET_PATCH_AVAILABLE and new_props.properties:
+                patch_builder = DatasetPatchBuilder(entity_urn)
+                for p in new_props.properties:
+                    patch_builder.add_structured_property(p.propertyUrn, self._assignment_value(p))
+                for patch_mcp in patch_builder.build():
+                    yield RecordEnvelope(record=patch_mcp, metadata=record_envelope.metadata)
+            else:
+                yield RecordEnvelope(
+                    record=MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=new_props),
+                    metadata=record_envelope.metadata,
+                )
+            return
+        existing = self._get_existing_structured_properties(entity_urn, record_envelope.record)
+        aspect_to_send = self._merge_structured_props(new_props, existing)
+        yield RecordEnvelope(
+            record=MetadataChangeProposalWrapper(entityUrn=entity_urn, aspect=aspect_to_send),
+            metadata=record_envelope.metadata,
+        )
+
     def _merge_structured_props(self, new_props: StructuredPropertiesClass, existing: Optional[StructuredPropertiesClass]) -> StructuredPropertiesClass:
         """Merge new_props into existing when semantics is PATCH; otherwise return new_props."""
         if self.config.semantics != "PATCH" or not existing or not existing.properties:
@@ -399,8 +444,11 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                             }
                             new_props = self._create_structured_properties(parsed_info)
                             if new_props.properties:
-                                existing = self._get_existing_structured_properties(entity_urn, record)
-                                aspect_to_send = self._merge_structured_props(new_props, existing)
+                                if self.config.semantics == "PATCH":
+                                    aspect_to_send = new_props
+                                else:
+                                    existing = self._get_existing_structured_properties(entity_urn, record)
+                                    aspect_to_send = self._merge_structured_props(new_props, existing)
                                 structured_props_mcp = MetadataChangeProposalWrapper(
                                     entityUrn=entity_urn,
                                     aspect=aspect_to_send
@@ -415,14 +463,8 @@ class QualifiedNameStructuredProperties(BaseTransformer):
                         if parsed_info and parsed_info.get('type') == 'table':
                             new_props = self._create_structured_properties(parsed_info)
                             if new_props.properties:
-                                existing = self._get_existing_structured_properties(entity_urn, record)
-                                aspect_to_send = self._merge_structured_props(new_props, existing)
-                                structured_props_mcp = MetadataChangeProposalWrapper(
-                                    entityUrn=entity_urn,
-                                    aspect=aspect_to_send
-                                )
                                 yield record_envelope
-                                yield RecordEnvelope(record=structured_props_mcp, metadata=record_envelope.metadata)
+                                yield from self._emit_dataset_structured_props(entity_urn, new_props, record_envelope)
                                 continue
                 
                 # Quick check: try to get entity_urn early for debugging
